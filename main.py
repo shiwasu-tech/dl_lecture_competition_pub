@@ -11,6 +11,8 @@ import torch.nn as nn
 import torchvision
 from torchvision import transforms
 
+from torch.optim.lr_scheduler import StepLR
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -286,13 +288,16 @@ def ResNet18():
 def ResNet50():
     return ResNet(BottleneckBlock, [3, 4, 6, 3])
 
+def ResNet101():
+    return ResNet(BottleneckBlock, [3, 4, 23, 3])
 
 class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, n_answer: int):
         super().__init__()
-        self.resnet = ResNet18()
+        #self.resnet = ResNet50()
+        self.resnet = ResNet101()
+        self.resnet.fc = nn.Linear(self.resnet.fc.in_features, 512)
         self.text_encoder = nn.Linear(vocab_size, 512)
-
         self.fc = nn.Sequential(
             nn.Linear(1024, 512),
             nn.ReLU(inplace=True),
@@ -358,6 +363,23 @@ def eval(model, dataloader, optimizer, criterion, device):
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
 
+class LabelSmoothingLoss(nn.Module):
+    def __init__(self, classes, smoothing=0.0, dim=-1):
+        super(LabelSmoothingLoss, self).__init__()
+        self.confidence = 1.0 - smoothing
+        self.smoothing = smoothing
+        self.cls = classes
+        self.dim = dim
+
+    def forward(self, pred, target):
+        pred = pred.log_softmax(dim=self.dim)
+        with torch.no_grad():
+            true_dist = torch.zeros_like(pred)
+            true_dist.fill_(self.smoothing / (self.cls - 1))
+            true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
+        return torch.mean(torch.sum(-true_dist * pred, dim=self.dim))
+
+
 def main():
     # deviceの設定
     set_seed(42)
@@ -368,8 +390,12 @@ def main():
         transforms.Resize((224, 224)),
         transforms.ToTensor()
     ])
-    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
-    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
+    
+    train_dataset_path = "C:/Users/keisu/マイドライブ/Colab Notebooks/DLBasics2024_colab/Final_VQA/dl_lecture_competition_pub/data/"
+    test_dataset_path = "C:/Users/keisu/マイドライブ/Colab Notebooks/DLBasics2024_colab/Final_VQA/dl_lecture_competition_pub/data/"
+    
+    train_dataset = VQADataset(df_path=train_dataset_path+"train.json", image_dir=train_dataset_path+"train", transform=transform)
+    test_dataset = VQADataset(df_path=test_dataset_path+"valid.json", image_dir=test_dataset_path+"valid", transform=transform, answer=False)
     test_dataset.update_dict(train_dataset)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
@@ -379,12 +405,15 @@ def main():
 
     # optimizer / criterion
     num_epoch = 20
-    criterion = nn.CrossEntropyLoss()
+    #criterion = nn.CrossEntropyLoss()
+    criterion = LabelSmoothingLoss(classes=len(train_dataset.answer2idx), smoothing=0.1)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    scheduler = StepLR(optimizer, step_size=5, gamma=0.1)
 
     # train model
     for epoch in range(num_epoch):
         train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
+        scheduler.step()
         print(f"【{epoch + 1}/{num_epoch}】\n"
               f"train time: {train_time:.2f} [s]\n"
               f"train loss: {train_loss:.4f}\n"
@@ -402,8 +431,10 @@ def main():
 
     submission = [train_dataset.idx2answer[id] for id in submission]
     submission = np.array(submission)
-    torch.save(model.state_dict(), "model.pth")
-    np.save("submission.npy", submission)
+    
+    outputs_path = "C:/Users/keisu/マイドライブ/Colab Notebooks/DLBasics2024_colab/Final_VQA/dl_lecture_competition_pub/outputs/"
+    torch.save(model.state_dict(), outputs_path+"model.pth")
+    np.save(outputs_path+"submission.npy", submission)
 
 if __name__ == "__main__":
     main()
