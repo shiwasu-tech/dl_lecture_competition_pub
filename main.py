@@ -1,3 +1,4 @@
+import os
 import re
 import random
 import time
@@ -12,7 +13,10 @@ import torchvision
 from torchvision import transforms
 
 from torch.optim.lr_scheduler import StepLR
+from transformers import BertTokenizer,BertModel
+from dotenv import load_dotenv
 
+load_dotenv()
 
 def set_seed(seed):
     random.seed(seed)
@@ -71,6 +75,9 @@ class VQADataset(torch.utils.data.Dataset):
         self.df = pandas.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
         self.answer = answer
 
+        # BERT tokenizerの初期化
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+                
         # question / answerの辞書を作成
         self.question2idx = {}
         self.answer2idx = {}
@@ -132,22 +139,28 @@ class VQADataset(torch.utils.data.Dataset):
         """
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
+        '''
         question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
-        question_words = self.df["question"][idx].split(" ")
+        question_words = self.df["question"][idx].lower().split(" ")
         for word in question_words:
             try:
                 question[self.question2idx[word]] = 1  # one-hot表現に変換
             except KeyError:
                 question[-1] = 1  # 未知語
-
+        '''
+        
+        question = self.df["question"][idx]
+        inputs = self.tokenizer(question, return_tensors="pt", padding='max_length', truncation=True, max_length=128)
+        question_embeddings = inputs['input_ids'].squeeze(0)  # (seq_len)
+        
         if self.answer:
             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
 
-            return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
+            return image, question_embeddings, torch.Tensor(answers), int(mode_answer_idx)
 
         else:
-            return image, torch.Tensor(question)
+            return image, question_embeddings
 
     def __len__(self):
         return len(self.df)
@@ -294,19 +307,24 @@ def ResNet101():
 class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, n_answer: int):
         super().__init__()
-        #self.resnet = ResNet50()
-        self.resnet = ResNet101()
-        self.resnet.fc = nn.Linear(self.resnet.fc.in_features, 512)
-        self.text_encoder = nn.Linear(vocab_size, 512)
+        self.resnet = ResNet50()
+        #self.resnet = ResNet101()
+        #self.resnet.fc = nn.Linear(self.resnet.fc.in_features, 512)
+        self.bert=BertModel.from_pretrained('bert-base-uncased')
+        #self.text_encoder = nn.Linear(vocab_size, 512)
+        self.image_fc = nn.Linear(512,768)
+        
         self.fc = nn.Sequential(
-            nn.Linear(1024, 512),
+            nn.Linear(768+768, 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, n_answer)
         )
 
     def forward(self, image, question):
         image_feature = self.resnet(image)  # 画像の特徴量
-        question_feature = self.text_encoder(question)  # テキストの特徴量
+        image_feature = self.image_fc(image_feature)  # 画像特徴量を768次元に変換
+        #question_feature = self.text_encoder(question)  # テキストの特徴量
+        question_feature = self.bert(input_ids=question).last_hidden_state[:, 0, :]  # [CLS]トークンの埋め込み
 
         x = torch.cat([image_feature, question_feature], dim=1)
         x = self.fc(x)
@@ -388,14 +406,16 @@ def main():
     # dataloader / model
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
-        transforms.ToTensor()
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    train_dataset_path = "C:/Users/keisu/マイドライブ/Colab Notebooks/DLBasics2024_colab/Final_VQA/dl_lecture_competition_pub/data/"
-    test_dataset_path = "C:/Users/keisu/マイドライブ/Colab Notebooks/DLBasics2024_colab/Final_VQA/dl_lecture_competition_pub/data/"
+    dataset_path = os.getenv(dataset_path)
     
-    train_dataset = VQADataset(df_path=train_dataset_path+"train.json", image_dir=train_dataset_path+"train", transform=transform)
-    test_dataset = VQADataset(df_path=test_dataset_path+"valid.json", image_dir=test_dataset_path+"valid", transform=transform, answer=False)
+    train_dataset = VQADataset(df_path=dataset_path+"train.json", image_dir=dataset_path+"train", transform=transform)
+    test_dataset = VQADataset(df_path=dataset_path+"valid.json", image_dir=dataset_path+"valid", transform=transform, answer=False)
     test_dataset.update_dict(train_dataset)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
@@ -404,7 +424,7 @@ def main():
     model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
 
     # optimizer / criterion
-    num_epoch = 20
+    num_epoch = 2
     #criterion = nn.CrossEntropyLoss()
     criterion = LabelSmoothingLoss(classes=len(train_dataset.answer2idx), smoothing=0.1)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
@@ -432,7 +452,8 @@ def main():
     submission = [train_dataset.idx2answer[id] for id in submission]
     submission = np.array(submission)
     
-    outputs_path = "C:/Users/keisu/マイドライブ/Colab Notebooks/DLBasics2024_colab/Final_VQA/dl_lecture_competition_pub/outputs/"
+    outputs_path = os.getenv(outputs_path)
+    
     torch.save(model.state_dict(), outputs_path+"model.pth")
     np.save(outputs_path+"submission.npy", submission)
 
